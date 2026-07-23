@@ -1,0 +1,78 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: loop-print
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: loop-print
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "基础任务模板：循环 loop-count 次，每次循环间隔 loop-interval 秒，打印当前时间。用于验证 Argo Workflow 模板引用与参数传递。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: loop-print
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 1800
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          - name: loop-count
+            default: "3"
+            description: "循环次数"
+          - name: loop-interval
+            default: "2"
+            description: "每次循环的间隔秒数"
+          - name: enable-random-fail
+            default: "false"
+            description: "是否在脚本开始时按 50% 概率随机失败"
+      script:
+        resources:
+          requests:
+            cpu: "0.1"
+            memory: "64Mi"
+          limits:
+            cpu: "0.5"
+            memory: "256Mi"
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+        image: yangtu/cix:0.1.1
+        imagePullPolicy: IfNotPresent
+        command: [sh, -eux]
+        source: |
+          LOOP_COUNT="{{inputs.parameters.loop-count}}"
+          LOOP_INTERVAL="{{inputs.parameters.loop-interval}}"
+          ENABLE_RANDOM_FAIL="{{inputs.parameters.enable-random-fail}}"
+
+          echo "=== loop-print 开始 ==="
+          echo "循环次数: ${LOOP_COUNT}，间隔: ${LOOP_INTERVAL}s，随机失败: ${ENABLE_RANDOM_FAIL}"
+
+          # 按需在脚本开始时以 50% 概率随机失败
+          if [ "${ENABLE_RANDOM_FAIL}" = "true" ]; then
+            RANDOM_VALUE=$((RANDOM % 2))
+            echo "随机失败判定值: ${RANDOM_VALUE}（0=失败，1=继续）"
+            if [ "${RANDOM_VALUE}" -eq 0 ]; then
+              echo "=== 随机失败触发，脚本退出 ==="
+              exit 1
+            fi
+          fi
+          echo "循环次数: ${LOOP_COUNT}，间隔: ${LOOP_INTERVAL}s"
+
+          i=1
+          while [ "${i}" -le "${LOOP_COUNT}" ]; do
+            echo "[第 ${i}/${LOOP_COUNT} 次] 当前时间: $(date '+%Y-%m-%d %H:%M:%S')"
+            if [ "${i}" -lt "${LOOP_COUNT}" ]; then
+              sleep "${LOOP_INTERVAL}"
+            fi
+            i=$((i + 1))
+          done
+
+          echo "=== loop-print 结束 ==="

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-pv
+  labels:
+    app: pipeline-shared
+spec:
+  capacity:
+    storage: 80Gi          # 只是配额声明，NFS 不会真正按此限制
+  accessModes:
+    - ReadWriteMany         # RWX：多 Pod 同时读写，NFS 的核心能力
+  persistentVolumeReclaimPolicy: Retain   # 删 PVC 后数据保留
+  nfs:
+    server: 192.168.10.131
+    path: /data/pipeline/shared-data
+    readOnly: false
+  mountOptions:
+    - hard                  # 硬挂载：server 断开时挂起等恢复，避免数据静默损坏
+    - timeo=600             # 超时 60 秒（单位 0.1 秒）
+    - retrans=2             # 重传次数
+    - nfsvers=4.1           # 使用 NFSv4.1

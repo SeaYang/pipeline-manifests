@@ -1,0 +1,195 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-build-image
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: go-build-image
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "在上游 go-build 产出的静态二进制基础上，用 buildctl（直连集群内 buildkitd）包装成最小运行镜像，导出为 docker tar 落到共享 PVC，并把 tar 路径暴露给下游（镜像上传 nexus3）。注意：本节点只做『打包装镜像』，不重新编译——编译由上游 go-build 完成。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: go-build-image
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 声明本模板依赖的卷。
+  # 说明：当父 Workflow 通过 templateRef 调用本模板时，Argo 不会自动带入这里的 volumes，
+  #       父 Workflow 需在自身的 spec.volumes 中声明同名卷（shared-data）。
+  #       这里保留声明是为了：1) 文档化依赖；2) 支持以 workflowTemplateRef 整体引用或独立测试。
+  volumes:
+    # 共享存储 PVC（基于 NFS，搭建见 docs/存储/基于NFS的PV-PVC共享存储搭建.md）
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: nfs-pvc
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 1800
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          - name: pipeline-run-name
+            # default: "{{workflow.name}}"
+            default: "git-sync-qdpkt"
+            description: "本次运行名称，用作产物输出目录的隔离前缀（避免并发构建互相覆盖）"
+          - name: build-artifact-path
+            default: "/shared-data/target/git-sync-qdpkt/go-web-demo"
+            description: "上游 go-build 输出的二进制绝对路径（在共享 PVC 上），如 /shared-data/target/git-sync-qdpkt/go-web-demo"
+          - name: build-artifact-name
+            default: "go-web-demo"
+            description: "二进制在镜像内的目标文件名（即 ENTRYPOINT 执行的文件名），通常取自上游 go-build 的同名出参，无扩展名"
+          - name: build-image-name
+            default: "go-web-demo"
+            description: "目标镜像名（repo 名），如 go-web-demo"
+          - name: build-image-tag
+            # default: "latest"
+            default: "0.0.1"
+            description: "目标镜像 tag，如 latest / 1.0 / git-commit-id"
+          - name: build-image-target-path
+            default: "/shared-data/image"
+            description: "pv 中保存镜像 tar 的根目录（挂在共享 PVC 上，每次 run 在其下建子目录隔离）"
+          - name: build-runtime-base-image
+            default: "192.168.10.134:8082/go-runtime-base:alpine-3.22"
+            description: "运行时基础镜像（最终镜像 FROM 的镜像）。默认用本地 nexus3 的 go-runtime-base（已预装 tzdata+ca-certificates+上海时区），使最终镜像构建不再 apk add、不再依赖外网 DNS（规避 buildkitd Pod 无全局 IPv6 路由时 alpine/musl 解析 dl-cdn.alpinelinux.org 失败）。构建/推送见 docs/工具/go运行时基础镜像构建.md。要求上游二进制为静态链接（CGO_ENABLED=0，go-build 默认即如此）。若上游改用 CGO_ENABLED=1，需换成带 glibc 的基础镜像（如 debian-slim）。"
+          - name: build-app-port
+            default: "9000"
+            description: "应用监听端口，仅写入 EXPOSE 做文档化，不影响实际监听"
+          - name: buildkit-addr
+            default: "tcp://buildkitd:1234"
+            description: "buildkitd 远程监听地址（remote 模式）；集群内需部署 buildkitd 的 Deployment+Service（与 buildkit-build 同一依赖）"
+          - name: buildkit-image
+            default: "moby/buildkit:v0.31.1"
+            description: "buildctl 客户端镜像（自带 buildctl 二进制），需与 buildkitd 版本匹配；国内建议预加载后改 imagePullPolicy: Never"
+      outputs:
+        parameters:
+          - name: build-image-tar-path
+            valueFrom:
+              path: /tmp/build-image-tar-path
+          - name: build-image-ref
+            valueFrom:
+              path: /tmp/build-image-ref
+      script:
+        resources:
+          requests:
+            cpu: "0.5"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+        volumeMounts:
+          # 共享存储：读上游 go-build 的二进制、写镜像 tar。
+          - mountPath: /shared-data/
+            name: shared-data
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+        # 运行 buildctl 客户端（在 moby/buildkit 镜像里）。
+        # 关键：buildctl 处于 remote 模式时，读取的是『本 Pod 的本地文件系统（PVC）』并把上下文流式发给 buildkitd，
+        #       故 buildkitd 不需要挂 PVC；本 Pod 负责读二进制、写 tar。
+        image: "{{inputs.parameters.buildkit-image}}"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，不依赖外部 configMap；Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n" "$*"; }
+
+          # ---------- 错误码（集中定义，语义与 go-build / git-sync 保持一致）----------
+          readonly EXIT_USER_ERROR=100       # 用户参数/配置错误（二进制不存在等）
+          readonly EXIT_BUILD_ERROR=110      # 镜像构建失败（buildctl 返回非零）
+          readonly EXIT_EXTERNAL_ERROR=170   # 外部依赖错误（buildkitd 不可达 / 基础镜像拉取失败）
+
+          # ---------- 入参 -> shell 变量 ----------
+          artifact_path="{{inputs.parameters.build-artifact-path}}"
+          artifact_name="{{inputs.parameters.build-artifact-name}}"
+          image_name="{{inputs.parameters.build-image-name}}"
+          image_tag="{{inputs.parameters.build-image-tag}}"
+          image_target_path="{{inputs.parameters.build-image-target-path}}"
+          base_image="{{inputs.parameters.build-runtime-base-image}}"
+          app_port="{{inputs.parameters.build-app-port}}"
+          buildkit_addr="{{inputs.parameters.buildkit-addr}}"
+          run_name="{{inputs.parameters.pipeline-run-name}}"
+
+          buildctl -v
+
+          # ---------- 1. 校验上游二进制 ----------
+          if [ ! -f "$artifact_path" ]; then
+            error "上游二进制不存在: $artifact_path（请确认 go-build 是否成功、出参是否正确）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          info "上游二进制: $artifact_path"
+
+          # ---------- 2. 准备构建上下文目录（PVC 上，按 run 隔离）----------
+          ctx_dir="${image_target_path}/${run_name}/ctx"
+          rm -rf "$ctx_dir"
+          mkdir -p "$ctx_dir"
+          # 拷贝二进制到上下文（保持可执行位），构建上下文最小化：只有『二进制 + Dockerfile』。
+          cp -f "$artifact_path" "${ctx_dir}/${artifact_name}"
+          chmod +x "${ctx_dir}/${artifact_name}"
+
+          # ---------- 3. 生成运行时 Dockerfile ----------
+          # 设计要点：
+          #   - 上游 go-build 默认 CGO_ENABLED=0，产出纯静态二进制，可跑在最小 alpine 上（甚至 scratch）；
+          #   - 时区(tzdata)+ca-certificates 已预装进基础镜像 go-runtime-base（见 build-runtime-base-image 默认值与
+          #     docs/工具/go运行时基础镜像构建.md），故此处不再 apk add、不再依赖外网 DNS——规避 buildkitd Pod
+          #     无全局 IPv6 路由时 alpine/musl 解析 dl-cdn.alpinelinux.org 失败（bad address）的问题；
+          #   - 非 root 运行（端口 >1024 无需特权），更安全。
+          #   若上游改用 CGO_ENABLED=1，需把 base 换成带 glibc 的镜像（如 debian-slim），否则二进制跑不起来。
+          cat > "${ctx_dir}/Dockerfile" <<EOF
+          # 由 go-build-image 自动生成：把已编译好的静态二进制包装成最小运行镜像（不再编译、不再 apk add——
+          # 时区/证书已内建进基础镜像 go-runtime-base，避免构建期访问外网 Alpine 源）。
+          FROM ${base_image}
+          RUN addgroup -S app && adduser -S -G app app
+          WORKDIR /app
+          COPY ${artifact_name} /app/${artifact_name}
+          USER app
+          EXPOSE ${app_port}
+          ENTRYPOINT ["/app/${artifact_name}"]
+          EOF
+
+          info "生成的 Dockerfile："
+          sed 's/^/    /' "${ctx_dir}/Dockerfile"
+
+          # ---------- 4. 计算 tar 输出路径 ----------
+          tar_dir="${image_target_path}/${run_name}"
+          mkdir -p "$tar_dir"
+          image_ref="${image_name}:${image_tag}"
+          # 磁盘上的 tar 文件名：把 image_name 里的 / 替换成 -（父流水线传入的是 app-name/env，
+          # 含斜杠；斜杠会被当成目录分隔符，导致 buildctl 的 dest 父目录不存在而报
+          # 'no such file or directory'）。仅影响文件名，tar 内部镜像 ref 仍为 image_name:image_tag。
+          image_file_name="${image_name//\//-}"
+          tar_path="${tar_dir}/${image_file_name}-${image_tag}.tar"
+
+          # ---------- 5. buildctl 构建并导出 docker tar ----------
+          # type=docker,dest=tar：导出 docker 格式 tar，下游既可 docker load，也可被 skopeo 以 docker-archive: 读取推送。
+          # （参考 docs/构建/镜像构建与推送设计.md 与 go-web-demo-Dockerfile与buildctl实战.md）
+          info "开始构建镜像 ${image_ref} -> ${tar_path} ..."
+          if ! buildctl --addr "${buildkit_addr}" build \
+              --frontend dockerfile.v0 \
+              --local context="${ctx_dir}" \
+              --local dockerfile="${ctx_dir}" \
+              --progress=plain \
+              --output type=docker,name="${image_ref}",dest="${tar_path}"; then
+            error "镜像构建失败，常见原因：1) buildkitd 不可达（${buildkit_addr}）；2) buildkitd 未配置 Docker Hub 镜像加速导致基础镜像拉取超时"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+
+          # ---------- 6. 校验产物 ----------
+          if [ ! -s "$tar_path" ]; then
+            error "镜像 tar 未生成或为空: $tar_path"
+            exit "$EXIT_BUILD_ERROR"
+          fi
+          ls -lh "$tar_path"
+
+          # ---------- 7. 写出参 ----------
+          echo -n "$tar_path" > /tmp/build-image-tar-path
+          echo -n "$image_ref" > /tmp/build-image-ref
+          info "go-build-image 完成，镜像 tar: $tar_path（ref: ${image_ref}）"

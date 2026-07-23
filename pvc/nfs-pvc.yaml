@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-pvc
+  namespace: argo
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""   # 空字符串 = 不走动态供给，强制绑定到上面手建的静态 PV
+  volumeName: nfs-pv     # 直接指定要绑定的 PV，避免绑错
+  resources:
+    requests:
+      storage: 80Gi     # 必须 <= PV 的 capacity，否则绑不上

@@ -1,0 +1,162 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-cicd-pipeline
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: go-cicd-pipeline
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "Go 应用全链路 CICD 流水线（DAG）：git-sync 拉源码并算版本元数据 → go-build 编译静态二进制 → go-build-image 用 buildkitd 打成运行镜像 tar → push-image-nexus3 用 skopeo 推送到 nexus3 → go-k8s-deploy-via-api 直调 k8s API（SSA + rollout 轮询）部署。五个子任务以 templateRef 引用 basetasktemplate 下已发布的 WorkflowTemplate，本清单只做编排与参数衔接。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: go-cicd-pipeline
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: main
+  # 卷声明：通过 templateRef 调用子任务时，Argo 不会带入子模板 spec.volumes 里的卷，
+  #           父流水线必须在自身 spec.volumes 中声明同名卷（shared-data / gitee-ssh）。
+  # go-k8s-deploy-via-api 不挂 PVC（用 in-cluster SA token + CA 认证），这里声明不影响它。
+  volumes:
+    # 共享存储 PVC（基于 NFS，搭建见 docs/存储/基于NFS的PV-PVC共享存储搭建.md）
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: nfs-pvc
+    # Gitee SSH 凭据（见 secrets/gitee-ssh-secret.yaml）
+    - name: gitee-ssh
+      secret:
+        secretName: gitee-ssh-secret
+  arguments:
+    parameters:
+      # ======================== 应用与源码（必填）========================
+      - name: app-name
+        default: "go-web-demo"
+        description: "应用唯一标识；同时构成 nexus 镜像 repo 路径，且当 deploy-name 留空时作为 Deployment 名（须 DNS-1123）"
+      - name: git-url
+        default: "git@gitee.com:awsomeyangtu/go-web-demo.git"
+        description: "Gitee 仓库 SSH URL，如 git@gitee.com:xxx/yyy.git"
+      - name: git-branch
+        default: "master"
+        description: "目标构建分支"
+      # ======================== 应用与环境（可选）========================
+      - name: env
+        value: "dev"
+        description: "环境标识（dev/test/prod），构成镜像 repo 路径的一部分"
+      # ======================== 编译（可选）==============================
+      - name: build-context-path
+        value: "."
+        description: "构建命令执行目录（go.mod 所在目录），相对工作区路径；单模块填 . 即可，多模块 monorepo 填对应子模块目录（如 service-a）"
+      - name: build-module-path
+        value: "cmd/server"
+        description: "构建模块路径（main 函数所在目录），相对 build-context-path 的路径；main 在 go.mod 同级目录则填 ."
+      - name: build-go-env
+        value: "CGO_ENABLED=0"
+        description: "编译环境变量前缀，默认禁用 CGO 做静态链接（运行镜像需匹配静态二进制）"
+      - name: build-go-image
+        value: "golang:1.26.4-alpine"
+        description: "自带 Go 工具链的构建镜像"
+  templates:
+    - name: main
+      dag:
+        # 线性依赖链：git-sync → go-build → go-build-image → push-image-nexus3 → go-k8s-deploy-via-api
+        # 每步消费上一步的 output parameter。采用 DAG（而非 steps）便于后续插入并行/旁路节点（单测、集成测试、通知等）。
+        tasks:
+          # ============ 1. 代码同步与版本元数据 ============
+          - name: git-sync
+            templateRef:
+              name: git-sync
+              template: entrypoint
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+                - name: env
+                  value: "{{workflow.parameters.env}}"
+                - name: pipeline-run-name
+                  value: "{{workflow.name}}"
+                - name: git-url
+                  value: "{{workflow.parameters.git-url}}"
+                - name: git-branch
+                  value: "{{workflow.parameters.git-branch}}"
+
+          # ============ 2. 编译静态二进制 ============
+          - name: go-build
+            depends: git-sync
+            templateRef:
+              name: go-build
+              template: entrypoint
+            arguments:
+              parameters:
+                - name: pipeline-run-name
+                  value: "{{workflow.name}}"
+                # 工作区：直接取上游 git-sync 的 rsync 目标路径（小元数据走 param）。
+                - name: build-workspace-path
+                  value: "{{tasks.git-sync.outputs.parameters.build-workspace-path}}"
+                - name: build-context-path
+                  value: "{{workflow.parameters.build-context-path}}"
+                - name: build-module-path
+                  value: "{{workflow.parameters.build-module-path}}"
+                - name: build-go-env
+                  value: "{{workflow.parameters.build-go-env}}"
+                # 产物名（= git-sync 的 revision），上游算出、下游直接用。
+                - name: build-artifact-name
+                  value: "{{tasks.git-sync.outputs.parameters.build-artifact-name}}"
+                - name: build-go-image
+                  value: "{{workflow.parameters.build-go-image}}"
+
+          # ============ 3. 打包运行镜像（buildkitd，导出 docker tar）============
+          - name: go-build-image
+            depends: go-build
+            templateRef:
+              name: go-build-image
+              template: entrypoint
+            arguments:
+              parameters:
+                - name: pipeline-run-name
+                  value: "{{workflow.name}}"
+                # 二进制路径：上游 go-build 产物的绝对路径（PVC 上的大产物）。
+                - name: build-artifact-path
+                  value: "{{tasks.go-build.outputs.parameters.build-artifact-path}}"
+                - name: build-artifact-name
+                  value: "{{tasks.git-sync.outputs.parameters.build-artifact-name}}"
+                # 本地 tar 内部 ref 的 repo 部分（不含 registry/端口）。
+                - name: build-image-name
+                  value: "{{workflow.parameters.app-name}}/{{workflow.parameters.env}}"
+                # 镜像 tag：复用 git-sync 的 revision（时间戳.分支.short），唯一且可追溯。
+                - name: build-image-tag
+                  value: "{{tasks.git-sync.outputs.parameters.build-artifact-name}}"
+
+          # ============ 4. 推送镜像到 nexus3（skopeo）============
+          - name: push-image-nexus3
+            depends: go-build-image
+            templateRef:
+              name: push-image-nexus3
+              template: entrypoint
+            arguments:
+              parameters:
+                # 镜像 tar：上游 go-build-image 导出的 docker tar（PVC 上）。
+                - name: build-image-tar-path
+                  value: "{{tasks.go-build-image.outputs.parameters.build-image-tar-path}}"
+                # nexus3 docker-hosted：端口即仓库，repo 名为 app-name/env（不含 docker-hosted 前缀）。
+                - name: nexus-repo-name
+                  value: "{{workflow.parameters.app-name}}/{{workflow.parameters.env}}"
+                # tag 与 go-build-image 保持一致，保证 tar 内 ref 与推送目标同名。
+                - name: nexus-image-tag
+                  value: "{{tasks.git-sync.outputs.parameters.build-artifact-name}}"
+
+          # ============ 5. 部署到 k8s（直调 API + SSA + rollout 轮询）============
+          - name: go-k8s-deploy-via-api
+            depends: push-image-nexus3
+            templateRef:
+              name: go-k8s-deploy-via-api
+              template: entrypoint
+            arguments:
+              parameters:
+                # 部署镜像：上游 push 产出的完整 ref（registry/app-name/env:revision）。
+                - name: image-ref
+                  value: "{{tasks.push-image-nexus3.outputs.parameters.nexus-image-ref}}"
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"

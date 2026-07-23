@@ -1,0 +1,46 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: loop-print-template
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: loop-print-template
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "流水线模板：仅引用 loop-print 基础任务模板，循环打印当前时间。用于验证 templateRef 编排与参数衔接。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: loop-print-template
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: main
+  arguments:
+    parameters:
+      - name: loop-count
+        default: "30"
+        description: "循环次数"
+      - name: loop-interval
+        default: "2"
+        description: "每次循环的间隔秒数"
+      - name: enable-random-fail
+        default: "false"
+        description: "是否在脚本开始时按 50% 概率随机失败"
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: loop-print
+            templateRef:
+              name: loop-print
+              template: entrypoint
+            arguments:
+              parameters:
+                - name: loop-count
+                  value: "{{workflow.parameters.loop-count}}"
+                - name: loop-interval
+                  value: "{{workflow.parameters.loop-interval}}"
+                - name: enable-random-fail
+                  value: "{{workflow.parameters.enable-random-fail}}"

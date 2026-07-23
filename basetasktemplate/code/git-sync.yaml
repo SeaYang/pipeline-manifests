@@ -1,0 +1,269 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: git-sync
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: git-sync
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "同步 Git 仓库到本地缓存，rsync 到本次运行的 workspace，并生成下游构建/上传所需的元数据。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: git-sync
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 声明本模板依赖的卷。
+  # 说明：当父 Workflow 通过 templateRef 调用本模板时，Argo 不会自动带入这里的 volumes，
+  #       父 Workflow 需在自身的 spec.volumes 中声明同名卷（shared-data / gitee-ssh）。
+  #       这里保留声明是为了：1) 文档化依赖；2) 支持以 workflowTemplateRef 整体引用或独立测试。
+  volumes:
+    # 共享存储 PVC（基于 NFS，搭建见 docs/存储/基于NFS的PV-PVC共享存储搭建.md）
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: nfs-pvc
+    # Gitee SSH 凭据（见 secrets/gitee-ssh-secret.yaml）
+    - name: gitee-ssh
+      secret:
+        secretName: gitee-ssh-secret
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 1800
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          - name: app-name
+            default: "go-web-demo"
+            description: "应用唯一标识，作为缓存目录名、制品名、镜像 repo 路径的一部分"
+          - name: env
+            default: "none"
+            description: "环境标识（dev/test/prod 等），用于构成制品/镜像路径"
+          - name: pipeline-run-name
+            default: "{{workflow.name}}"
+            description: "本次运行名称，用于构建隔离的 workspace 子目录"
+          - name: git-url
+            default: "git@gitee.com:awsomeyangtu/go-web-demo.git"
+            description: "Gitee 仓库 SSH URL，如 git@gitee.com:xxx/yyy.git"
+          - name: git-branch
+            default: "master"
+            description: "目标构建分支"
+          - name: build-artifact-storage-repo
+            default: "raw-hosted"
+            description: "普通制品仓库名（Nexus），如 raw-hosted、maven-hosted 等"
+          - name: build-image-storage-repo
+            default: "docker-hosted"
+            description: "镜像仓库名（Nexus），固定 docker-hosted"
+          - name: git-repo-cache-dir
+            default: "/shared-data/git"
+            description: "PVC 上的 Git 仓库本地缓存根目录（跨 pipeline 复用，增量 fetch）"
+          - name: git-sync-lock-dir
+            default: "/shared-data/git-lock"
+            description: "PVC 上的文件锁目录（flock 锁文件载体，必须在共享卷上）"
+          - name: build-workspace-dir
+            default: "/shared-data/workspace"
+            description: "工作目录根，每次 pipeline-run 一个子目录（内部使用）"
+          - name: git-default-branch
+            default: "master"
+            description: "默认分支，首次 clone 与 cleanup 回退均使用，以节省磁盘"
+          - name: artifact-repo-domain
+            default: "192.168.10.134"
+            description: "制品仓库域名/IP（Nexus）。nexus3 中普通制品与镜像端口不同；生产可用 nginx 按域名路由"
+          - name: dot-git-dir-sync-switch
+            default: "false"
+            description: "是否在 rsync 时包含 .git 目录（构建工具需要 git 元信息时开启）"
+      outputs:
+        parameters:
+          - name: git-repo-path
+            valueFrom:
+              path: /tmp/git-repo-path
+          - name: git-commit-id
+            valueFrom:
+              path: /tmp/git-commit-id
+          - name: git-short-commit-id
+            valueFrom:
+              path: /tmp/git-short-commit-id
+          - name: build-workspace-path
+            valueFrom:
+              path: /tmp/build-workspace-path
+          - name: build-artifact-repo-path
+            valueFrom:
+              path: /tmp/build-artifact-repo-path
+          - name: build-image-repo-path
+            valueFrom:
+              path: /tmp/build-image-repo-path
+          - name: build-artifact-name
+            valueFrom:
+              path: /tmp/build-artifact-name
+          - name: build-image-name
+            valueFrom:
+              path: /tmp/build-image-name
+          - name: build-timestamp
+            valueFrom:
+              path: /tmp/build-timestamp
+      # Argo 级互斥（workflow-controller 层排队）；flock 为文件系统级硬保证，二者互为补充。
+      # 3.7+ 可改用 mutexes 新语法。
+      synchronization:
+        mutex:
+          name: "{{inputs.parameters.app-name}}"
+      script:
+        resources:
+          requests:
+            cpu: "0.1"
+            memory: "256Mi"
+          limits:
+            cpu: "0.5"
+            memory: "1Gi"
+        volumeMounts:
+          - mountPath: /shared-data/
+            name: shared-data
+          - mountPath: /gitee-ssh
+            name: gitee-ssh
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+        # 基础镜像：yangtu/cix（基于 alpine，预装 git/rsync/openssh/curl 等；已加装 coreutils=GNU date、util-linux=flock -w）
+        # 国内拉取 Docker Hub 可能需要加速器，或在 worker 预加载后改 imagePullPolicy: Never
+        image: "yangtu/cix:0.1.1"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，不依赖外部 configMap；Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"    "$*"; }
+          warn()  { printf "${C_Y} [Warning] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n"    "$*"; }
+
+          # ---------- 错误码（集中定义，便于上游区分）----------
+          readonly EXIT_USER_ERROR=100      # 用户参数/配置错误
+          readonly EXIT_RSYNC_ERROR=110     # rsync 内部错误
+          readonly EXIT_EXTERNAL_ERROR=170  # 外部依赖错误（git remote 不可达 / 获取锁超时）
+
+          # ---------- 1. SSH 凭据（secret 挂载默认 0444，SSH 拒绝，故拷到 /root/.ssh 并收紧权限）----------
+          cp -R /gitee-ssh /root/.ssh 2>/dev/null || true
+          chmod 700 /root/.ssh 2>/dev/null || true
+          chmod -R 400 /root/.ssh/* 2>/dev/null || true
+          git config --global --add safe.directory "*"
+          git --version
+
+          # ---------- 2. 获取文件锁（flock，内核级原子）----------
+          # 锁文件必须落在共享 PVC 上：/tmp 是每 Pod 独立的，放那里 flock 无法跨 Pod 互斥。
+          mkdir -p {{inputs.parameters.git-sync-lock-dir}}
+          LOCK_FILE="{{inputs.parameters.git-sync-lock-dir}}/{{inputs.parameters.app-name}}.lock"
+          exec 9>"$LOCK_FILE"
+          # -x 排他锁；-w 60 最多等待 60 秒，超时则失败(exit 170)，避免持锁任务卡死导致无限阻塞。
+          # 正常并发同步由 Argo mutex 在 controller 层串行化，flock 作为文件系统级兜底，争用概率很低。
+          if ! flock -x -w 60 9; then
+            error "获取代码同步锁超时(60s)，请检查是否有任务卡死: $LOCK_FILE"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+          info "已获取文件锁(flock): $LOCK_FILE"
+          # 脚本退出（正常或异常）时 fd 9 关闭，锁由内核自动释放，不会死锁。
+
+          git_repo_path="{{inputs.parameters.git-repo-cache-dir}}/{{inputs.parameters.app-name}}"
+
+          # ---------- 3. 缓存校验：remote.url 变更则删除旧缓存 ----------
+          if [ -d "$git_repo_path/.git" ]; then
+            origin_url=$(git config --file "$git_repo_path/.git/config" --get remote.origin.url 2>/dev/null || true)
+            if [ "$origin_url" != "{{inputs.parameters.git-url}}" ]; then
+              warn "缓存仓库 remote.url($origin_url) 与入参不一致，删除旧缓存重建"
+              rm -rf "$git_repo_path"
+            fi
+          fi
+
+          sync_failed()    { error "代码同步失败，请联系应用开发人员检查代码或配置"; exit "$EXIT_EXTERNAL_ERROR"; }
+          switch_failed()  { error "代码 Switch 失败，请检查分支 {{inputs.parameters.git-branch}} 是否存在"; exit "$EXIT_USER_ERROR"; }
+          branch_missing() { error "分支 {{inputs.parameters.git-branch}} 不存在，请联系应用开发人员检查"; exit "$EXIT_USER_ERROR"; }
+          rsync_failed()   { error "rsync 同步失败，请联系应用开发人员检查代码或配置"; exit "$EXIT_RSYNC_ERROR"; }
+
+          # ---------- 4. 首次克隆 / 进入缓存 ----------
+          if [ ! -d "$git_repo_path/.git" ]; then
+            mkdir -p "$git_repo_path"
+            info "首次克隆 {{inputs.parameters.git-url}} -> $git_repo_path"
+            git clone --branch {{inputs.parameters.git-default-branch}} {{inputs.parameters.git-url}} "$git_repo_path" || sync_failed
+          fi
+
+          cd "$git_repo_path"
+          git remote prune origin || sync_failed
+          # 清理上次意外残留的锁文件与脏数据
+          find .git -name "*.lock" -delete
+          git clean --force -d -x
+          git reset --hard || sync_failed
+
+          # ---------- 5. 校验并拉取目标分支 ----------
+          exists=$(git ls-remote --heads origin "refs/heads/{{inputs.parameters.git-branch}}" | wc -l | tr -d ' ')
+          if [ "$exists" -eq 0 ]; then
+            branch_missing
+          fi
+          git fetch origin {{inputs.parameters.git-branch}} || sync_failed
+
+          # 用 switch 而非 checkout：分支名与文件名同名时 checkout 会失败
+          git switch {{inputs.parameters.git-branch}} || switch_failed
+          git reset --hard "origin/{{inputs.parameters.git-branch}}" || sync_failed
+
+          # ---------- 6. 计算版本元数据 ----------
+          echo "latest 5 commits:"
+          git log -5 --pretty=format:"%h - %an, %ar : %s"
+          echo
+
+          short=$(git rev-parse --short HEAD)
+          long=$(git rev-parse HEAD)
+          # 毫秒级时间戳（镜像已含 coreutils，GNU date 支持 %3N）
+          build_timestamp=$(date "+%Y%m%d%H%M%S%3N")
+
+          # 分支名中的 / 替换为 -，用于构成制品名（如 feature/1.0.0 -> feature-1.0.0）
+          branch=$(echo "{{inputs.parameters.git-branch}}" | sed 's/\//-/g')
+          revision="${build_timestamp}.${branch}.${short}"
+
+          # 制品基础名（无扩展名，扩展名由后续构建步骤决定）
+          build_artifact_name="${revision}"
+          # Nexus 存储目录（仓库内相对路径，无文件名），由 artifact-upload 拼成完整 URL
+          build_artifact_repo_path="{{inputs.parameters.app-name}}/{{inputs.parameters.env}}/"
+          # 镜像存储子路径（仓库内相对路径）
+          build_image_repo_path="{{inputs.parameters.app-name}}/{{inputs.parameters.env}}/${revision}/"
+
+          # 镜像完整 tag
+          # nexus3 docker-hosted 固定走 8082 端口；普通制品走 8081（由下游 artifact-upload 拼接）
+          # 生产可用 nginx 按域名路由，届时去掉此端口
+          build_image_name="{{inputs.parameters.artifact-repo-domain}}:8082/{{inputs.parameters.build-image-storage-repo}}/{{inputs.parameters.app-name}}/{{inputs.parameters.env}}:${revision}"
+
+          # ---------- 7. rsync 到本次运行的 workspace（幂等：先清空再同步）----------
+          build_workspace_path="{{inputs.parameters.build-workspace-dir}}/{{inputs.parameters.pipeline-run-name}}/git/"
+          rm -rf "$build_workspace_path"
+          mkdir -p "$build_workspace_path"
+          if [ "{{inputs.parameters.dot-git-dir-sync-switch}}" = "true" ]; then
+            rsync -a ./ "$build_workspace_path" || rsync_failed
+          else
+            rsync -a ./ "$build_workspace_path" --exclude .git || rsync_failed
+          fi
+
+          # ---------- 8. cleanup：切回默认分支，删除其它本地分支，节省磁盘 ----------
+          git switch {{inputs.parameters.git-default-branch}} || switch_failed
+          git fetch origin {{inputs.parameters.git-default-branch}} || sync_failed
+          git reset --hard "origin/{{inputs.parameters.git-default-branch}}" || sync_failed
+          branches_count=$(git branch | grep -v "{{inputs.parameters.git-default-branch}}" | wc -l | tr -d ' ')
+          branches_count=$((branches_count+0))
+          if [ "$branches_count" -gt 0 ]; then
+            info "清理非默认本地分支以节省磁盘"
+            git branch | grep -v "{{inputs.parameters.git-default-branch}}" | xargs -r git branch -D >/dev/null 2>&1 || warn "部分分支未能删除，继续"
+          fi
+
+          # ---------- 9. 写出参 ----------
+          write_output() { echo -n "$2" > "/tmp/$1"; }
+          write_output "git-repo-path"            "$git_repo_path"
+          write_output "git-commit-id"            "$long"
+          write_output "git-short-commit-id"      "$short"
+          write_output "build-workspace-path"     "$build_workspace_path"
+          write_output "build-artifact-repo-path" "$build_artifact_repo_path"
+          write_output "build-image-repo-path"    "$build_image_repo_path"
+          write_output "build-artifact-name"      "$build_artifact_name"
+          write_output "build-image-name"         "$build_image_name"
+          write_output "build-timestamp"          "$build_timestamp"
+
+          info "git-sync 完成，revision=${revision}"

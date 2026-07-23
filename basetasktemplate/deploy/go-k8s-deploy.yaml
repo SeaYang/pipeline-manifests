@@ -1,0 +1,231 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-k8s-deploy
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: go-k8s-deploy
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "接收上游传入的完整镜像名（如 push-image-nexus3 的 nexus-image-ref），用 kubectl 在目标 k8s 集群部署 Deployment(默认2副本, 单pod 0.2c0.5g) + ClusterIP Service，并通过 readinessProbe(/healthz) + kubectl rollout status 判定部署是否成功。部署目标默认复用 argo 所在集群/命名空间。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: go-k8s-deploy
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 说明：本模板不需要共享 PVC——部署只消费「镜像名」这一个字符串入参，不读上游产物文件。
+  #       因此与 git-sync/go-build/push 等模板不同，这里不声明 volumes、父 Workflow 也无需带 shared-data。
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 600
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          - name: image-ref
+            # 无默认值：必须由上游传入（push-image-nexus3 的 nexus-image-ref）。
+            description: "上游传入的完整镜像名，如 192.168.10.134:8082/go-web-demo:0.0.1（取自 push-image-nexus3 的 nexus-image-ref 出参）"
+          - name: deploy-name
+            default: "go-web-demo"
+            description: "Deployment 与 Service 同名，也是 pod label app 的值；需为 DNS-1123 合法名（小写字母/数字/-）"
+          - name: deploy-namespace
+            default: "argo"
+            description: "部署目标 namespace。默认 argo（复用 argo 所在命名空间，ns 已存在、deploy-role.yml 的 RBAC 也部署在此）；若改为其它 ns，需先 kubectl create namespace 并把 deploy-role.yml 的 Role/RoleBinding 部署到该 ns"
+          - name: deploy-replicas
+            default: "2"
+            description: "Deployment 副本数，默认 2"
+          - name: deploy-container-port
+            default: "9000"
+            description: "应用容器监听端口（与 go-web-demo 一致），同时作为 containerPort 与健康检查端口"
+          - name: deploy-service-port
+            default: "9000"
+            description: "ClusterIP Service 暴露端口，targetPort 指向容器端口"
+          - name: deploy-cpu-limit
+            default: "200m"
+            description: "单 pod CPU 限制（0.2 核 = 200m）；requests 同 limits（Guaranteed QoS）"
+          - name: deploy-mem-limit
+            default: "512Mi"
+            description: "单 pod 内存限制（0.5Gi = 512Mi）；requests 同 limits（Guaranteed QoS）"
+          - name: deploy-health-path
+            default: "/healthz"
+            description: "健康检查 HTTP 路径（go-web-demo 提供 GET /healthz 返回 {\"code\":200,...}）；readinessProbe 是 rollout 成功 + Service 流量就绪的依据"
+          - name: deploy-image-pull-policy
+            default: "Always"
+            description: "应用镜像拉取策略，默认 Always（部署流水线中 tag 可能被重推同 tag 内容，Always 保证每次取最新）；若用不可变 tag/digest 可改 IfNotPresent 省流量"
+          - name: deploy-kubectl-image
+            default: "bitnami/kubectl:1.23"
+            description: "kubectl 客户端镜像（debian 系，自带 sh + kubectl），需与集群版本匹配（k8s 1.23.x）；argoexec 镜像是 distroless 无 kubectl/sh 故不可复用。国内建议预拉取或转存到 nexus3"
+      outputs:
+        parameters:
+          - name: deploy-service-clusterip
+            valueFrom:
+              path: /tmp/deploy-service-clusterip
+          - name: deploy-service-name
+            valueFrom:
+              path: /tmp/deploy-service-name
+      script:
+        resources:
+          requests:
+            cpu: "0.1"
+            memory: "128Mi"
+          limits:
+            cpu: "0.3"
+            memory: "256Mi"
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+        image: "{{inputs.parameters.deploy-kubectl-image}}"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，不依赖外部 configMap；Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n" "$*"; }
+
+          # ---------- 错误码（集中定义，语义与 go-build / push-image-nexus3 保持一致）----------
+          readonly EXIT_USER_ERROR=100       # 用户参数/配置错误（镜像名为空、namespace 不存在等）
+          readonly EXIT_EXTERNAL_ERROR=170   # 外部依赖错误（RBAC 不足 / apply 失败 / rollout 超时）
+
+          # ---------- 入参 -> shell 变量 ----------
+          image_ref="{{inputs.parameters.image-ref}}"
+          deploy_name="{{inputs.parameters.deploy-name}}"
+          deploy_ns="{{inputs.parameters.deploy-namespace}}"
+          replicas="{{inputs.parameters.deploy-replicas}}"
+          container_port="{{inputs.parameters.deploy-container-port}}"
+          service_port="{{inputs.parameters.deploy-service-port}}"
+          cpu_limit="{{inputs.parameters.deploy-cpu-limit}}"
+          mem_limit="{{inputs.parameters.deploy-mem-limit}}"
+          health_path="{{inputs.parameters.deploy-health-path}}"
+          pull_policy="{{inputs.parameters.deploy-image-pull-policy}}"
+
+          kubectl version --client=true 2>&1 | head -3
+
+          # ---------- 1. 校验入参 ----------
+          if [ -z "$image_ref" ] || [ "$image_ref" = "null" ]; then
+            error "image-ref 为空（请确认上游 push-image-nexus3 的 nexus-image-ref 是否正确传入本节点）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          if ! kubectl get namespace "$deploy_ns" >/dev/null 2>&1; then
+            error "目标 namespace 不存在: $deploy_ns（默认 argo；若改为其它 ns，请先 kubectl create namespace $deploy_ns，并把 deploy-role.yml 的 Role/RoleBinding 部署到该 ns）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          info "镜像: $image_ref"
+          info "目标: ns/$deploy_ns  deployment/$deploy_name  replicas=$replicas  probe=$health_path:$container_port"
+
+          # ---------- 2. 生成 Deployment + Service 清单 ----------
+          # 设计要点：
+          #   - resources requests=limits（Guaranteed QoS，且精确匹配「单pod 0.2c0.5g」限制）；
+          #   - readinessProbe(/healthz)：是「kubectl rollout status 成功」与「Service 可收流量」的共同依据；
+          #   - livenessProbe(/healthz)：进程卡死时自动重启；
+          #   - RollingUpdate maxUnavailable=0：滚动更新期间始终保持可用副本，更安全；
+          #   - 端口用命名端口 http，probe 引用 port: http，改端口只改一处。
+          manifest=/tmp/deploy.yaml
+          cat > "$manifest" <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${deploy_name}
+            namespace: ${deploy_ns}
+            labels:
+              app: ${deploy_name}
+              app.kubernetes.io/name: ${deploy_name}
+              app.kubernetes.io/part-of: pipeline
+              app.kubernetes.io/managed-by: argo-workflow
+          spec:
+            replicas: ${replicas}
+            selector:
+              matchLabels:
+                app: ${deploy_name}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${deploy_name}
+                  app.kubernetes.io/name: ${deploy_name}
+              spec:
+                containers:
+                  - name: app
+                    image: ${image_ref}
+                    imagePullPolicy: ${pull_policy}
+                    ports:
+                      - name: http
+                        containerPort: ${container_port}
+                    resources:
+                      requests:
+                        cpu: ${cpu_limit}
+                        memory: ${mem_limit}
+                      limits:
+                        cpu: ${cpu_limit}
+                        memory: ${mem_limit}
+                    readinessProbe:
+                      httpGet:
+                        path: ${health_path}
+                        port: http
+                      initialDelaySeconds: 3
+                      periodSeconds: 5
+                      failureThreshold: 3
+                    livenessProbe:
+                      httpGet:
+                        path: ${health_path}
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                      failureThreshold: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${deploy_name}
+            namespace: ${deploy_ns}
+            labels:
+              app: ${deploy_name}
+              app.kubernetes.io/name: ${deploy_name}
+              app.kubernetes.io/part-of: pipeline
+          spec:
+            type: ClusterIP
+            selector:
+              app: ${deploy_name}
+            ports:
+              - name: http
+                port: ${service_port}
+                targetPort: http
+          EOF
+
+          info "生成的部署清单："
+          sed 's/^/    /' "$manifest"
+
+          # ---------- 3. kubectl apply（声明式、幂等，支持重复部署/滚动更新）----------
+          info "kubectl apply -f $manifest ..."
+          if ! kubectl apply -f "$manifest"; then
+            error "kubectl apply 失败，常见原因：1) RBAC 不足——未部署 deploy-role.yml（argo SA 缺 deployment/service 管理权限）；2) 清单字段非法（端口/资源量格式等）"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+
+          # ---------- 4. 等待 rollout 完成（成功依据：所有副本 readinessProbe 通过）----------
+          # kubectl rollout status 在「新副本全部就绪」时返回 0，其就绪判定正是 readinessProbe，
+          # 故 /healthz 能通 = rollout 成功 = 部署成功。
+          info "等待 rollout 完成（readinessProbe $health_path 通过即视为成功，超时 480s）..."
+          if ! kubectl rollout status "deployment/${deploy_name}" -n "${deploy_ns}" --timeout=480s; then
+            error "rollout 未在超时内成功，常见原因：1) 镜像拉取失败——k8s 节点未把 nexus3 HTTP 仓库(192.168.10.134:8082)加入 /etc/docker/daemon.json 的 insecure-registries，或镜像不存在；2) /healthz 健康检查不通过（端口/路径不对、应用未就绪）；3) 资源不足。请执行：kubectl describe pod -n ${deploy_ns} -l app=${deploy_name} 与 kubectl get events -n ${deploy_ns}"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+
+          # ---------- 5. 写出参 + 汇总 ----------
+          clusterip=$(kubectl get svc "${deploy_name}" -n "${deploy_ns}" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+          echo -n "${clusterip:-unknown}" > /tmp/deploy-service-clusterip
+          echo -n "${deploy_name}"           > /tmp/deploy-service-name
+
+          kubectl get deploy,svc -n "${deploy_ns}" -l app.kubernetes.io/name="${deploy_name}"
+          info "go-k8s-deploy 完成：svc/${deploy_name} ClusterIP=${clusterip:-unknown}（ns=${deploy_ns}，port=${service_port}）"
+          info "集群内验证健康检查：kubectl -n ${deploy_ns} exec deploy/${deploy_name} -- curl -s http://${clusterip:-<clusterip>}:${service_port}${health_path}"

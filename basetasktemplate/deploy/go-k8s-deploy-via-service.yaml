@@ -1,0 +1,251 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-k8s-deploy-via-service
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: go-k8s-deploy-via-service
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "方案二（部署服务代理）：不直接 kubectl，而是调用自研「部署服务」的 HTTP API 间接部署。提交部署请求拿 deployId，再轮询状态到 SUCCEEDED/FAILED。k8s 写权限收敛在部署服务侧，本节点的 argo SA 不需要任何 k8s 权限。设计详见 docs/部署/go-k8s-deploy-via-service设计.md。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: go-k8s-deploy-via-service
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 说明：本模板不挂 PVC、也不需要 deploy-role 的 k8s 权限——
+  #       它只是个 HTTP 客户端，真正的 k8s 部署由「部署服务」用其自身凭证完成（凭证收敛，见设计文档 §安全模型）。
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 900
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          # ---- 镜像与部署规格（与方案一 go-k8s-deploy 同名同义，便于在父 Workflow 里直接替换 templateRef）----
+          - name: image-ref
+            description: "上游传入的完整镜像名，如 192.168.10.134:8082/go-web-demo:0.0.1（取自 push-image-nexus3 的 nexus-image-ref）"
+          - name: deploy-name
+            default: "go-web-demo"
+            description: "Deployment/Service 同名（透传给部署服务）"
+          - name: deploy-namespace
+            default: "argo"
+            description: "目标 namespace（透传给部署服务；本节点 argo SA 无需该 ns 的任何 RBAC）"
+          - name: deploy-replicas
+            default: "2"
+            description: "副本数（透传）"
+          - name: deploy-container-port
+            default: "9000"
+            description: "容器端口（透传）"
+          - name: deploy-service-port
+            default: "9000"
+            description: "Service 端口（透传）"
+          - name: deploy-cpu-limit
+            default: "200m"
+            description: "单 pod CPU（透传）"
+          - name: deploy-mem-limit
+            default: "512Mi"
+            description: "单 pod 内存（透传）"
+          - name: deploy-health-path
+            default: "/healthz"
+            description: "健康检查路径（透传，部署服务据此配 readiness/liveness 并作为成功依据）"
+          - name: deploy-image-pull-policy
+            default: "Always"
+            description: "应用镜像拉取策略（透传）"
+          # ---- 部署服务对接参数 ----
+          - name: deploy-service-url
+            description: "部署服务 base URL，如 http://deploy-service.deploy:8080（集群内 DNS）或 http://192.168.10.x:8080；末尾不要带 /"
+          - name: deploy-api-submit-path
+            default: "/api/v1/deploys"
+            description: "提交部署的 POST 路径（拼在 deploy-service-url 之后）"
+          - name: deploy-api-status-path
+            default: "/api/v1/deploys"
+            description: "查询状态的 GET 路径前缀（实际请求 = base + 此值 + /{deployId}）"
+          - name: deploy-service-poll-interval
+            default: "5"
+            description: "轮询状态间隔（秒）"
+          - name: deploy-service-timeout
+            default: "600"
+            description: "整体轮询超时（秒），到点仍未 SUCCEEDED 视为失败"
+          - name: deploy-service-auth-token-secret
+            default: "deploy-service-token"
+            description: "存放「流水线→部署服务」bearer token 的 Secret 名（含 key=token）；默认 deploy-service-token。optional=true，未创建该 Secret 时跳过鉴权头"
+          - name: curl-image
+            default: "curlimages/curl:7.88.1"
+            description: "curl 客户端镜像，必须自带 sh（Argo script 需要）。⚠️ curlimages/curl:8.x 是 Wolfi/distroless 无 shell 不可用；7.x 为 Alpine 系含 busybox(sh/grep/sed/date)+curl。离线可预焙 alpine+curl(+jq) 进 nexus3 后改本值"
+      outputs:
+        parameters:
+          - name: deploy-id
+            valueFrom:
+              path: /tmp/deploy-id
+          - name: deploy-service-clusterip
+            valueFrom:
+              path: /tmp/deploy-service-clusterip
+          - name: deploy-status
+            valueFrom:
+              path: /tmp/deploy-status
+      script:
+        resources:
+          requests:
+            cpu: "0.1"
+            memory: "128Mi"
+          limits:
+            cpu: "0.3"
+            memory: "256Mi"
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+          # 流水线→部署服务 的 bearer token（可选）。optional: true：未创建 Secret 时不报错、env 不注入，脚本据此跳过鉴权头。
+          - name: DEPLOY_SERVICE_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: "{{inputs.parameters.deploy-service-auth-token-secret}}"
+                key: token
+                optional: true
+        image: "{{inputs.parameters.curl-image}}"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n" "$*"; }
+
+          # ---------- 错误码（与 go-k8s-deploy / push 等保持一致）----------
+          readonly EXIT_USER_ERROR=100       # 入参错误（镜像名为空、服务地址缺失等）
+          readonly EXIT_EXTERNAL_ERROR=170   # 外部依赖错误（服务不可达 / 提交被拒 / 轮询超时 / 部署失败）
+
+          # ---------- 入参 -> shell 变量 ----------
+          image_ref="{{inputs.parameters.image-ref}}"
+          deploy_name="{{inputs.parameters.deploy-name}}"
+          deploy_ns="{{inputs.parameters.deploy-namespace}}"
+          replicas="{{inputs.parameters.deploy-replicas}}"
+          container_port="{{inputs.parameters.deploy-container-port}}"
+          service_port="{{inputs.parameters.deploy-service-port}}"
+          cpu_limit="{{inputs.parameters.deploy-cpu-limit}}"
+          mem_limit="{{inputs.parameters.deploy-mem-limit}}"
+          health_path="{{inputs.parameters.deploy-health-path}}"
+          pull_policy="{{inputs.parameters.deploy-image-pull-policy}}"
+
+          svc_url="{{inputs.parameters.deploy-service-url}}"
+          submit_path="{{inputs.parameters.deploy-api-submit-path}}"
+          status_path="{{inputs.parameters.deploy-api-status-path}}"
+          poll_interval="{{inputs.parameters.deploy-service-poll-interval}}"
+          overall_timeout="{{inputs.parameters.deploy-service-timeout}}"
+
+          curl --version | head -1
+
+          # ---------- 1. 校验入参 ----------
+          if [ -z "$image_ref" ] || [ "$image_ref" = "null" ]; then
+            error "image-ref 为空（请确认上游 push-image-nexus3 的 nexus-image-ref 是否正确传入）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          if [ -z "$svc_url" ] || [ "$svc_url" = "null" ]; then
+            error "deploy-service-url 为空（部署服务地址必填，如 http://deploy-service.deploy:8080）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          info "镜像: $image_ref"
+          info "部署服务: ${svc_url}（ns=${deploy_ns}, replicas=${replicas}, probe=${health_path}:${container_port}）"
+
+          # ---------- 鉴权头（可选）：用 positional params 安全携带，避免 token 内空格被拆词 ----------
+          # DEPLOY_SERVICE_TOKEN 未注入（未创建 Secret）时为空 → 不带 Authorization 头。
+          set --
+          if [ -n "${DEPLOY_SERVICE_TOKEN:-}" ]; then
+            set -- -H "Authorization: Bearer ${DEPLOY_SERVICE_TOKEN}"
+            info "鉴权：携带 bearer token（Secret {{inputs.parameters.deploy-service-auth-token-secret}}）"
+          else
+            info "鉴权：未配置 token（Secret 未创建或为空），以匿名身份调用部署服务"
+          fi
+
+          # ---------- 扁平 JSON 字段抽取（busybox sh，不依赖 jq）----------
+          # 匹配 "field": "value" 形式的首个值；适用于本契约的扁平响应。
+          json_get() {
+            grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+              | head -1 \
+              | sed "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"//" \
+              | sed 's/".*//'
+          }
+
+          # ---------- 2. 组装请求体并 POST 提交（异步：期望返回 deployId）----------
+          body=$(cat <<EOF
+          {"imageRef":"${image_ref}","name":"${deploy_name}","namespace":"${deploy_ns}","replicas":${replicas},"containerPort":${container_port},"servicePort":${service_port},"cpuLimit":"${cpu_limit}","memLimit":"${mem_limit}","healthPath":"${health_path}","imagePullPolicy":"${pull_policy}"}
+          EOF
+          )
+          info "POST ${svc_url}${submit_path}"
+          info "body: ${body}"
+
+          submit_resp=$(curl -sS -X POST "${svc_url}${submit_path}" \
+              -H "Content-Type: application/json" \
+              "$@" \
+              --max-time 30 \
+              -w '\n%{http_code}' \
+              -d "$body") || {
+            error "调用部署服务失败（不可达）：${svc_url}${submit_path}（请确认部署服务是否已部署且网络可达）"
+            exit "$EXIT_EXTERNAL_ERROR"
+          }
+          http_code=$(printf '%s' "$submit_resp" | tail -n1)
+          resp_body=$(printf '%s' "$submit_resp" | sed '$d')
+          case "$http_code" in
+            200|201|202) info "提交响应 HTTP ${http_code}" ;;
+            *) error "部署服务拒绝请求（HTTP ${http_code}）：${resp_body}"; exit "$EXIT_EXTERNAL_ERROR" ;;
+          esac
+          deploy_id=$(printf '%s' "$resp_body" | json_get deployId)
+          if [ -z "$deploy_id" ]; then
+            error "部署服务响应未含 deployId（期望 {\"deployId\":\"...\",\"status\":\"PENDING\"}）：${resp_body}"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+          info "已提交，deployId=${deploy_id}"
+
+          # ---------- 3. 轮询状态到终态（SUCCEEDED / FAILED）或超时 ----------
+          info "轮询部署状态（每 ${poll_interval}s，整体超时 ${overall_timeout}s）..."
+          status_url="${svc_url}${status_path}/${deploy_id}"
+          start=$(date +%s)
+          final_status=""; clusterip=""
+          while :; do
+            now=$(date +%s); elapsed=$((now - start))
+            if [ "$elapsed" -gt "$overall_timeout" ]; then
+              error "部署轮询超时（${overall_timeout}s），deployId=${deploy_id}；可手动查询 ${status_url}"
+              exit "$EXIT_EXTERNAL_ERROR"
+            fi
+
+            # 重新组装鉴权 positional params（GET 同样需要）
+            set --
+            [ -n "${DEPLOY_SERVICE_TOKEN:-}" ] && set -- -H "Authorization: Bearer ${DEPLOY_SERVICE_TOKEN}"
+
+            s_resp=$(curl -sS -X GET "$status_url" "$@" --max-time 15 || true)
+            status=$(printf '%s' "$s_resp" | json_get status)
+            case "$status" in
+              SUCCEEDED)
+                final_status="SUCCEEDED"
+                clusterip=$(printf '%s' "$s_resp" | json_get serviceClusterIP)
+                break
+                ;;
+              FAILED|ERROR)
+                message=$(printf '%s' "$s_resp" | json_get message)
+                error "部署服务报告失败（deployId=${deploy_id}）：${message:-（原因见部署服务日志）}"
+                echo "    响应: ${s_resp}"
+                exit "$EXIT_EXTERNAL_ERROR"
+                ;;
+              PENDING|RUNNING|"")
+                info "  ...${status:-未知}（已 ${elapsed}s）"
+                sleep "$poll_interval"
+                ;;
+              *)
+                info "  ...未知状态 [${status}]（已 ${elapsed}s），继续等待"
+                sleep "$poll_interval"
+                ;;
+            esac
+          done
+
+          # ---------- 4. 写出参 + 汇总 ----------
+          echo -n "${deploy_id}"          > /tmp/deploy-id
+          echo -n "${clusterip:-unknown}" > /tmp/deploy-service-clusterip
+          echo -n "${final_status}"       > /tmp/deploy-status
+          info "go-k8s-deploy-via-service 完成：deployId=${deploy_id}  status=${final_status}  ClusterIP=${clusterip:-unknown}"
+          info "集群内验证：kubectl -n ${deploy_ns} exec deploy/${deploy_name} -- curl -s http://${clusterip:-<clusterip>}:${service_port}${health_path}"

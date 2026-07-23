@@ -1,0 +1,159 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: push-image-nexus3
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: push-image-nexus3
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "读取共享 PVC 上的 docker 镜像 tar（go-build-image 等节点产出），用 skopeo 推送到 nexus3 的 docker-hosted 仓库。本节点与语言无关——任何落到 PVC 的镜像 tar 都可推。仓库地址/认证通过入参与 Secret 配置。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: push-image-nexus3
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 声明本模板依赖的卷。
+  # 说明：当父 Workflow 通过 templateRef 调用本模板时，Argo 不会自动带入这里的 volumes，
+  #       父 Workflow 需在自身的 spec.volumes 中声明同名卷（shared-data）。
+  #       这里保留声明是为了：1) 文档化依赖；2) 支持以 workflowTemplateRef 整体引用或独立测试。
+  volumes:
+    # 共享存储 PVC（基于 NFS，搭建见 docs/存储/基于NFS的PV-PVC共享存储搭建.md）
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: nfs-pvc
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 900
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          - name: build-image-tar-path
+            default: "/shared-data/image/git-sync-qdpkt/go-web-demo-0.0.1.tar"
+            description: "待推送的镜像 tar 绝对路径（在共享 PVC 上），通常来自上游 go-build-image 的 build-image-tar-path 出参"
+          - name: nexus-docker-registry
+            default: "192.168.10.134:8082"
+            description: "nexus3 docker-hosted 仓库地址（host:port）；学习环境为 HTTP 8082（见 环境搭建/制品仓库/nexus3搭建.md）"
+          - name: nexus-repo-name
+            default: "go-web-demo"
+            description: "仓库内镜像名（repo path），如 go-web-demo；最终推送 ref = registry/repo:tag"
+          - name: nexus-image-tag
+            # default: "latest"
+            default: "0.0.1"
+            description: "推送的目标 tag，如 latest / 1.0 / git-commit-id"
+          - name: nexus-insecure
+            default: "true"
+            description: "是否跳过 TLS 校验。nexus3 docker-hosted 默认 HTTP（8082），需为 true；若仓库已启用 HTTPS 则设 false"
+          - name: nexus-credential-secret
+            default: "nexus-credentials"
+            description: "存放 nexus 账号密码的 Secret 名（见下方 envFrom secretKeyRef）；默认 nexus-credentials"
+          - name: skopeo-image
+            default: "quay.io/skopeo/stable:v1.19.0"
+            description: "skopeo 客户端镜像；国内建议预加载后改 imagePullPolicy: Never；镜像需提供 sh 与 skopeo"
+      outputs:
+        parameters:
+          - name: nexus-image-ref
+            valueFrom:
+              path: /tmp/nexus-image-ref
+          - name: nexus-image-digest
+            valueFrom:
+              path: /tmp/nexus-image-digest
+      script:
+        resources:
+          requests:
+            cpu: "0.2"
+            memory: "256Mi"
+          limits:
+            cpu: "0.5"
+            memory: "512Mi"
+        volumeMounts:
+          # 共享存储：读取上游产出的镜像 tar（本节点只读消费）。
+          - mountPath: /shared-data/
+            name: shared-data
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+          # nexus 账号密码走 Secret（与 buildkit-build 用 secretKeyRef 管理凭据的做法一致）。
+          # 建议为制品上传单独建账号，避免直接用 admin。Secret 创建见设计文档「前置资源」。
+          - name: NEXUS_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: "{{inputs.parameters.nexus-credential-secret}}"
+                key: username
+          - name: NEXUS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: "{{inputs.parameters.nexus-credential-secret}}"
+                key: password
+        image: "{{inputs.parameters.skopeo-image}}"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，不依赖外部 configMap；Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n" "$*"; }
+
+          # ---------- 错误码（集中定义，语义与 go-build / go-build-image 保持一致）----------
+          readonly EXIT_USER_ERROR=100       # 用户参数/配置错误（tar 不存在、账号缺失等）
+          readonly EXIT_EXTERNAL_ERROR=170   # 外部依赖错误（nexus 不可达 / 认证失败 / 推送失败）
+
+          # ---------- 入参 -> shell 变量 ----------
+          tar_path="{{inputs.parameters.build-image-tar-path}}"
+          registry="{{inputs.parameters.nexus-docker-registry}}"
+          repo="{{inputs.parameters.nexus-repo-name}}"
+          tag="{{inputs.parameters.nexus-image-tag}}"
+          insecure="{{inputs.parameters.nexus-insecure}}"
+
+          skopeo --version
+
+          # ---------- 1. 校验入参 ----------
+          if [ ! -s "$tar_path" ]; then
+            error "镜像 tar 不存在或为空: $tar_path（请确认上游 go-build-image 是否成功）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          if [ -z "${NEXUS_USERNAME:-}" ] || [ -z "${NEXUS_PASSWORD:-}" ]; then
+            error "nexus 账号/密码为空，请检查 Secret（默认 nexus-credentials，含 username/password 两个 key）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          info "待推送 tar: $tar_path"
+
+          # ---------- 2. 组装目标 ref 与 TLS 标志 ----------
+          target_ref="${registry}/${repo}:${tag}"
+          tls_opt=""
+          if [ "$insecure" = "true" ]; then
+            # nexus3 docker-hosted 默认 HTTP，需关闭目的端 TLS 校验（含自签/纯 HTTP 两种场景）。
+            tls_opt="--dest-tls-verify=false"
+          fi
+
+          # ---------- 3. skopeo 拷贝：docker-archive(tar) -> docker(nexus) ----------
+          # docker-archive: 直接读 docker 格式 tar（buildctl --output type=docker 产物）；
+          # 推送时按 target_ref 重命名，与 tar 内部原 ref 无关。
+          info "开始推送镜像到 nexus3: ${target_ref} ..."
+          if ! skopeo copy --retry-times 3 \
+              --dest-creds "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+              ${tls_opt} \
+              "docker-archive:${tar_path}" \
+              "docker://${target_ref}"; then
+            error "推送失败，常见原因：1) nexus3 不可达（${registry}）；2) 账号/密码错误；3) 仓库非 docker-hosted 或端口不对；4) HTTP 仓库未把 nexus-insecure 设为 true"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+
+          # ---------- 4. 查询并写出参（digest 可供下游校验完整性）----------
+          # 用 skopeo 原生 --format 取 Digest，比 sed 解析 JSON 稳健；查询失败不阻断（推送已成功）。
+          digest=$(skopeo inspect \
+              --format '{{.Digest}}' \
+              --creds "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+              ${tls_opt} \
+              "docker://${target_ref}" 2>/dev/null || true)
+
+          echo -n "$target_ref" > /tmp/nexus-image-ref
+          echo -n "${digest:-unknown}" > /tmp/nexus-image-digest
+          info "push-image-nexus3 完成，镜像: ${target_ref}（digest: ${digest:-unknown}）"

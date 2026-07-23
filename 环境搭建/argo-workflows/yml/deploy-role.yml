@@ -1,0 +1,43 @@
+# 为部署任务模板 go-k8s-deploy 补充 RBAC（argo 官方 install.yaml 未授予的 deployment/service 权限）。
+#
+# 背景：argo3.4.8.yml 把 argo ServiceAccount 绑定到 argo-cluster-role，但该 ClusterRole
+# 只授权了 pods / configmaps / PVC / argoproj.io 等资源，**没有 deployments / services 的管理权限**。
+# go-k8s-deploy 任务要在目标 namespace 里 kubectl apply（Deployment+Service）并 kubectl rollout status，
+# 因此需要补一个 Role 授权 apps/deployments、apps/replicasets、core/services、core/pods 等。
+#
+# 与 workflow-role.yml 同属「补齐 argo 工作流任务所需 RBAC」的一类，故放在同目录。
+#
+# 适用：kubectl apply -f deploy-role.yml
+# 注意：本 Role/RoleBinding 部署在 argo namespace（与 go-k8s-deploy 的默认 deploy-namespace 一致）。
+#       若把部署目标改为其它 namespace，需：1) kubectl create namespace <ns>；
+#       2) 将本文件的 metadata.namespace 与 RoleBinding 一并改到该 ns 后再 apply。
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deploy-role
+  namespace: argo
+rules:
+  # 部署主体：Deployment（apply / 滚动更新）+ rollout status 读取 ReplicaSet
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/finalizers", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Service（ClusterIP）apply + 排查用：pods/pods-log/events
+  - apiGroups: [""]
+    resources: ["services", "services/finalizers", "pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-role-binding
+  namespace: argo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deploy-role
+subjects:
+  # go-k8s-deploy（及其它部署类模板）的 script Pod 用 argo SA 运行
+  - kind: ServiceAccount
+    name: argo
+    namespace: argo

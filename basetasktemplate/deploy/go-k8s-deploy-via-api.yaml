@@ -1,0 +1,335 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-k8s-deploy-via-api
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: go-k8s-deploy-via-api
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "方案三（直调 k8s REST API）：不用 kubectl、也不用部署服务，直接用 curl 打 k8s API——Server-Side Apply 创建/更新 Deployment+Service（Pod 内 ServiceAccount token+CA 认证），再轮询 Deployment status 直到 availableReplicas 就绪。与方案一权限模型相同（仍需 deploy-role），只是把 kubectl 换成 curl，价值在于透明（看清 apply 底层）与去 CLI 依赖。设计详见 docs/部署/go-k8s-deploy-via-api设计.md。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: go-k8s-deploy-via-api
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 说明：方案三不挂 PVC。认证用 Argo 自动挂载到 Pod 的 ServiceAccount token + CA
+  #       （/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt} + KUBERNETES_SERVICE_HOST/PORT），
+  #       权限仍由 deploy-role.yml 提供（argo SA 管理 deployment/service），与方案一相同。
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 900
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          # ---- 镜像与部署规格（与方案一/二同名同义，便于在父 Workflow 里直接替换 templateRef）----
+          - name: image-ref
+            default: "192.168.10.134:8082/go-web-demo:0.0.1"
+            description: "上游传入的完整镜像名，如 192.168.10.134:8082/go-web-demo:0.0.1（取自 push-image-nexus3 的 nexus-image-ref）"
+          - name: deploy-name
+            default: ""
+            description: "Deployment/Service 同名（DNS-1123）；留空则回退 app-name"
+          - name: app-name
+            default: ""
+            description: "应用标识；deploy-name 为空时作为 Deployment/Service 名的回退（父流水线约定：部署名默认 = 应用标识）"
+          - name: deploy-namespace
+            default: "argo"
+            description: "目标 namespace；默认 argo（需存在；deploy-role 也部署在此）"
+          - name: deploy-replicas
+            default: "2"
+            description: "副本数"
+          - name: deploy-container-port
+            default: "9000"
+            description: "容器端口（containerPort + 探针端口）"
+          - name: deploy-service-port
+            default: "9000"
+            description: "ClusterIP Service 端口"
+          - name: deploy-cpu-limit
+            default: "200m"
+            description: "单 pod CPU（requests=limits）"
+          - name: deploy-mem-limit
+            default: "512Mi"
+            description: "单 pod 内存（requests=limits）"
+          - name: deploy-health-path
+            default: "/healthz"
+            description: "健康检查路径；readinessProbe 是 Deployment availableReplicas 就绪的判定依据"
+          - name: deploy-image-pull-policy
+            default: "Always"
+            description: "应用镜像拉取策略"
+          - name: deploy-image-pull-secret
+            default: "nexus-registry-credentials"
+            description: "拉取私有镜像用的 imagePullSecret 名（type=kubernetes.io/dockerconfigjson，含 Nexus 凭据）。需存在于 deploy-namespace。规避 Nexus3 3.77+ 的 null:// bearer bug：要求 Nexus 仓库开启 Force basic authentication（走 Basic 认证），本 secret 提供账号密码。留空则不生成 imagePullSecrets（仅当镜像公开可匿名拉时）。"
+          # ---- API 对接参数 ----
+          - name: field-manager
+            default: "go-k8s-deploy"
+            description: "Server-Side Apply 的 fieldManager 名（标识本调用方拥有的字段；force=true 会接管他人字段）"
+          - name: rollout-timeout
+            default: "480"
+            description: "等待 rollout 就绪的超时（秒）；readinessProbe 长期不过则到点失败"
+          - name: rollout-poll-interval
+            default: "5"
+            description: "轮询 Deployment status 的间隔（秒）"
+      outputs:
+        parameters:
+          - name: deploy-service-clusterip
+            valueFrom:
+              path: /tmp/deploy-service-clusterip
+          - name: deploy-status
+            valueFrom:
+              path: /tmp/deploy-status
+      script:
+        resources:
+          requests:
+            cpu: "0.1"
+            memory: "128Mi"
+          limits:
+            cpu: "0.3"
+            memory: "256Mi"
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+        image: "yangtu/cix:0.1.1"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n" "$*"; }
+
+          # ---------- 错误码（与方案一/二保持一致）----------
+          readonly EXIT_USER_ERROR=100       # 入参错误（镜像名为空、namespace 不存在、缺少 in-cluster 凭证等）
+          readonly EXIT_EXTERNAL_ERROR=170   # 外部依赖错误（RBAC 拒绝 / apply 失败 / rollout 超时）
+
+          # ---------- 入参 -> shell 变量 ----------
+          image_ref="{{inputs.parameters.image-ref}}"
+          deploy_name="{{inputs.parameters.deploy-name}}"
+          app_name="{{inputs.parameters.app-name}}"
+          deploy_ns="{{inputs.parameters.deploy-namespace}}"
+          replicas="{{inputs.parameters.deploy-replicas}}"
+          container_port="{{inputs.parameters.deploy-container-port}}"
+          service_port="{{inputs.parameters.deploy-service-port}}"
+          cpu_limit="{{inputs.parameters.deploy-cpu-limit}}"
+          mem_limit="{{inputs.parameters.deploy-mem-limit}}"
+          health_path="{{inputs.parameters.deploy-health-path}}"
+          pull_policy="{{inputs.parameters.deploy-image-pull-policy}}"
+          image_pull_secret="{{inputs.parameters.deploy-image-pull-secret}}"
+          field_manager="{{inputs.parameters.field-manager}}"
+          rollout_timeout="{{inputs.parameters.rollout-timeout}}"
+          poll_interval="{{inputs.parameters.rollout-poll-interval}}"
+
+          curl --version | head -1
+
+          # ---------- 1. 校验入参 ----------
+          # deploy-name 留空则回退 app-name（父流水线约定：Deployment 名默认 = 应用标识）。
+          # ⚠️ 必须在 shell 里做回退，不能用 Argo 表达式 {{=default(workflow.parameters.app-name, ...)}}：
+          #    expr 引擎把带连字符的 app-name / deploy-name 当作减法（app - name）解析失败，整个 {{=...}}
+          #    会被原样透传成字面量，curl 拿到带 {{}} 的 URL 直接报 nested brace（见 argoproj/argo-workflows#5804）。
+          #    改用简单 {{...}} 替换（支持连字符）+ 这里 shell 兜底。
+          if [ -z "$deploy_name" ] || [ "$deploy_name" = "null" ]; then
+            deploy_name="$app_name"
+          fi
+          if [ -z "$deploy_name" ] || [ "$deploy_name" = "null" ]; then
+            error "deploy-name 与 app-name 均为空，无法确定 Deployment/Service 名"
+            exit "$EXIT_USER_ERROR"
+          fi
+          if [ -z "$image_ref" ] || [ "$image_ref" = "null" ]; then
+            error "image-ref 为空（请确认上游 push-image-nexus3 的 nexus-image-ref 是否正确传入）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          # in-cluster 凭证：Argo 自动挂载的 SA token + CA + 服务地址
+          SA_TOKEN_FILE="/var/run/secrets/kubernetes.io/serviceaccount/token"
+          SA_CA_FILE="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+          if [ -z "${KUBERNETES_SERVICE_HOST:-}" ] || [ -z "${KUBERNETES_SERVICE_PORT:-}" ]; then
+            error "未检测到 in-cluster 环境变量 KUBERNETES_SERVICE_HOST/PORT（应在 k8s Pod 内运行）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          if [ ! -s "$SA_TOKEN_FILE" ] || [ ! -s "$SA_CA_FILE" ]; then
+            error "缺少 ServiceAccount token/ca.crt（Pod 应挂载 SA 凭证；确认 argo SA 的 automountServiceAccountToken 未被关闭）"
+            exit "$EXIT_USER_ERROR"
+          fi
+          APISERVER="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+          # 注意：本模板用 sh（非 bash），不能用数组（AUTH=(...) 会报 syntax error "("）。
+          #       把认证拆成普通变量，在每个 curl 调用里内联 -H/--cacert/-sS（POSIX 兼容）。
+          SA_TOKEN="$(cat "$SA_TOKEN_FILE")"
+          AUTH_HEADER="Authorization: Bearer ${SA_TOKEN}"
+          info "镜像: $image_ref"
+          if [ -n "$image_pull_secret" ] && [ "$image_pull_secret" != "null" ]; then
+            info "拉取凭据: imagePullSecret=${image_pull_secret}（需 Nexus 仓库开启 Force basic authentication）"
+          else
+            info "拉取凭据: 无（匿名拉取；私有仓库会因 401/bearer 失败）"
+          fi
+          info "目标: ns/$deploy_ns  deployment/$deploy_name  replicas=$replicas  probe=$health_path:$container_port"
+          info "APISERVER: $APISERVER（in-cluster SA 鉴权）"
+
+          # 目标 namespace 可达性 + RBAC 预检：探测 deployments（复用 deploy-role 已授的 list 权限）。
+          # ⚠️ 不要去 GET namespaces——那是 cluster-scoped 资源，deploy-role 未授权会【恒返回 403】误报。
+          #    namespace=argo 且 deploy-role 已 apply 时，这里返回 200；403=RBAC 缺失或目标 ns 不存在。
+          ns_code=$(curl -H "$AUTH_HEADER" --cacert "$SA_CA_FILE" -sS -o /dev/null -w '%{http_code}' "${APISERVER}/apis/apps/v1/namespaces/${deploy_ns}/deployments?limit=1")
+          case "$ns_code" in
+            200) : ;;
+            403) error "预检失败（HTTP 403）：未部署 deploy-role.yml（argo SA 缺 deployment 权限）或目标 namespace 不存在: $deploy_ns（默认 argo；若改其它，需先 kubectl create namespace 并把 deploy-role.yml 部署到该 ns）"; exit "$EXIT_EXTERNAL_ERROR" ;;
+            404) error "目标 namespace 不存在: $deploy_ns"; exit "$EXIT_USER_ERROR" ;;
+            *)   error "预检 deployments 返回 HTTP $ns_code"; exit "$EXIT_EXTERNAL_ERROR" ;;
+          esac
+
+          # ---------- 扁平字段抽取（busybox sh，不依赖 jq）----------
+          # 把 JSON 折成一行再取首个匹配；适用于本模板读取的 Deployment status 标量字段。
+          oneline() { tr '\n' ' ' | sed 's/  */ /g'; }
+          # 注意：末尾 || true——grep 匹配不到时返回 1，在 set -e 下会让调用方 avail=$(num_field ...) 直接退出。
+          # 字段缺失（如刚创建的 Deployment 还没有 availableReplicas）属正常，返回空串即可，由 ${avail:-0} 兜底。
+          num_field() { printf '%s' "$1" | grep -o "\"$2\": *[0-9]*" | head -1 | grep -o '[0-9]*$' || true; }
+          str_field() { printf '%s' "$1" | grep -o "\"$2\": *\"[^\"]*\"" | head -1 | sed "s/.*\"$2\": *\"//; s/\".*//" || true; }
+
+          # ---------- 2. 生成 Deployment + Service 清单（SSA 接受 YAML）----------
+          # imagePullSecrets 片段：私有仓库需凭据（规避 Nexus3 null:// bearer bug）；参数为空则不生成。
+          if [ -n "$image_pull_secret" ] && [ "$image_pull_secret" != "null" ]; then
+            IPS_BLOCK="$(printf '      imagePullSecrets:\n        - name: %s\n' "$image_pull_secret")"
+          else
+            IPS_BLOCK=""
+          fi
+          cat > /tmp/dep.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${deploy_name}
+            namespace: ${deploy_ns}
+            labels:
+              app: ${deploy_name}
+              app.kubernetes.io/name: ${deploy_name}
+              app.kubernetes.io/part-of: pipeline
+              app.kubernetes.io/managed-by: argo-workflow
+          spec:
+            replicas: ${replicas}
+            selector:
+              matchLabels:
+                app: ${deploy_name}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+            template:
+              metadata:
+                labels:
+                  app: ${deploy_name}
+                  app.kubernetes.io/name: ${deploy_name}
+              spec:
+          ${IPS_BLOCK}
+                containers:
+                  - name: app
+                    image: ${image_ref}
+                    imagePullPolicy: ${pull_policy}
+                    ports:
+                      - { name: http, containerPort: ${container_port} }
+                    resources:
+                      requests: { cpu: ${cpu_limit}, memory: ${mem_limit} }
+                      limits:   { cpu: ${cpu_limit}, memory: ${mem_limit} }
+                    readinessProbe:
+                      httpGet: { path: ${health_path}, port: http }
+                      initialDelaySeconds: 3
+                      periodSeconds: 5
+                      failureThreshold: 3
+                    livenessProbe:
+                      httpGet: { path: ${health_path}, port: http }
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                      failureThreshold: 3
+          EOF
+
+          cat > /tmp/svc.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${deploy_name}
+            namespace: ${deploy_ns}
+            labels:
+              app: ${deploy_name}
+              app.kubernetes.io/name: ${deploy_name}
+              app.kubernetes.io/part-of: pipeline
+          spec:
+            type: ClusterIP
+            selector:
+              app: ${deploy_name}
+            ports:
+              - { name: http, port: ${service_port}, targetPort: http }
+          EOF
+
+          info "将对以下清单执行 Server-Side Apply（fieldManager=${field_manager}）："
+          sed 's/^/    /' /tmp/dep.yaml; echo "    ---"; sed 's/^/    /' /tmp/svc.yaml
+
+          # ---------- 3. Server-Side Apply：Deployment ----------
+          # ⚠️ SSA 必须用 PATCH（不是 PUT）。PATCH 的 content-type 决定 patch 策略：
+          #    application/apply-patch+yaml → SSA（存在则更新、不存在则创建，等价 kubectl apply --server-side）。
+          #    若误用 PUT，会被路由到 update/replace handler，该 handler 不认 apply-patch+yaml → HTTP 415。
+          # force=true：接管他人 fieldManager 持有的冲突字段（首次部署无所谓，重部署更稳）。
+          dep_code=$(curl -H "$AUTH_HEADER" --cacert "$SA_CA_FILE" -sS -X PATCH \
+              -H "Content-Type: application/apply-patch+yaml" \
+              "${APISERVER}/apis/apps/v1/namespaces/${deploy_ns}/deployments/${deploy_name}?fieldManager=${field_manager}&force=true" \
+              --data-binary @/tmp/dep.yaml \
+              -o /tmp/dep-resp.json -w '%{http_code}')
+          case "$dep_code" in
+            200|201) info "Deployment apply 成功（HTTP ${dep_code}）" ;;
+            401|403) error "Deployment apply 被拒（HTTP ${dep_code}）：RBAC 不足，未部署 deploy-role.yml（argo SA 缺 deployment 写权限）"; cat /tmp/dep-resp.json; exit "$EXIT_EXTERNAL_ERROR" ;;
+            *)       error "Deployment apply 失败（HTTP ${dep_code}）："; sed 's/^/    /' /tmp/dep-resp.json; exit "$EXIT_EXTERNAL_ERROR" ;;
+          esac
+
+          # ---------- 4. Server-Side Apply：Service ----------
+          svc_code=$(curl -H "$AUTH_HEADER" --cacert "$SA_CA_FILE" -sS -X PATCH \
+              -H "Content-Type: application/apply-patch+yaml" \
+              "${APISERVER}/api/v1/namespaces/${deploy_ns}/services/${deploy_name}?fieldManager=${field_manager}&force=true" \
+              --data-binary @/tmp/svc.yaml \
+              -o /tmp/svc-resp.json -w '%{http_code}')
+          case "$svc_code" in
+            200|201) info "Service apply 成功（HTTP ${svc_code}）" ;;
+            401|403) error "Service apply 被拒（HTTP ${svc_code}）：RBAC 不足"; cat /tmp/svc-resp.json; exit "$EXIT_EXTERNAL_ERROR" ;;
+            *)       error "Service apply 失败（HTTP ${svc_code}）："; sed 's/^/    /' /tmp/svc-resp.json; exit "$EXIT_EXTERNAL_ERROR" ;;
+          esac
+          clusterip=$(str_field "$(cat /tmp/svc-resp.json | oneline)" clusterIP)
+
+          # ---------- 5. 轮询 Deployment status 直到就绪（成功依据）----------
+          # availableReplicas 由 kubelet 按 readinessProbe 累计；availableReplicas==replicas(期望) 且
+          # observedGeneration==generation（controller 已处理本次变更）即视为部署成功——等价 kubectl rollout status。
+          info "轮询 Deployment status（每 ${poll_interval}s，超时 ${rollout_timeout}s）..."
+          info "  就绪判定：availableReplicas == spec.replicas 且 observedGeneration == generation"
+          start=$(date +%s)
+          while :; do
+            now=$(date +%s); elapsed=$((now - start))
+            if [ "$elapsed" -gt "$rollout_timeout" ]; then
+              error "rollout 超时（${rollout_timeout}s），availableReplicas 未达期望。常见原因：1) 镜像拉取失败——k8s 节点未把 nexus3 HTTP 仓库(192.168.10.134:8082)加入 insecure-registries；2) /healthz 不通；3) 资源不足。排查：kubectl describe pod -n ${deploy_ns} -l app=${deploy_name}"
+              exit "$EXIT_EXTERNAL_ERROR"
+            fi
+
+            code=$(curl -H "$AUTH_HEADER" --cacert "$SA_CA_FILE" -sS "${APISERVER}/apis/apps/v1/namespaces/${deploy_ns}/deployments/${deploy_name}" -o /tmp/dep-status.json -w '%{http_code}') || code="000"
+            if [ "$code" != "200" ]; then
+              info "  ...status 查询返回 HTTP ${code}（${elapsed}s），重试"; sleep "$poll_interval"; continue
+            fi
+            s=$(cat /tmp/dep-status.json | oneline)
+            avail=$(num_field "$s" availableReplicas)
+            desired=$(num_field "$s" replicas)            # 首个匹配 = spec.replicas
+            gen=$(num_field "$s" generation)
+            obsgen=$(num_field "$s" observedGeneration)
+            avail=${avail:-0}; desired=${desired:-0}; gen=${gen:-0}; obsgen=${obsgen:-0}
+
+            # 快速失败：k8s 在 progressDeadline(默认 600s) 后置此 reason
+            if printf '%s' "$s" | grep -q '"reason":"ProgressDeadlineExceeded"'; then
+              error "Deployment 报告 ProgressDeadlineExceeded（部署无法推进）"; exit "$EXIT_EXTERNAL_ERROR"
+            fi
+
+            info "  ...availableReplicas=${avail}/${desired}  observedGen=${obsgen}/${gen}（${elapsed}s）"
+            if [ "$avail" = "$desired" ] && [ "$desired" != "0" ] && [ "$obsgen" = "$gen" ]; then
+              break
+            fi
+            sleep "$poll_interval"
+          done
+
+          # ---------- 6. 写出参 + 汇总 ----------
+          echo -n "${clusterip:-unknown}" > /tmp/deploy-service-clusterip
+          echo -n "SUCCEEDED"             > /tmp/deploy-status
+          info "go-k8s-deploy-via-api 完成：deployment/${deploy_name} 就绪（${avail}/${desired}），svc ClusterIP=${clusterip:-unknown}（ns=${deploy_ns}）"
+          info "集群内验证健康检查：kubectl -n ${deploy_ns} exec deploy/${deploy_name} -- curl -s http://${clusterip:-<clusterip>}:${service_port}${health_path}"

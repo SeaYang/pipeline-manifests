@@ -1,0 +1,161 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-build
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: go-build
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+    kubernetes.io/os: linux
+  annotations:
+    app.kubernetes.io/description: "在上游 git-sync 同步的源码基础上，用 Go 工具链容器把源码编译成静态二进制，落到共享 PVC，并把产物路径暴露给下游（制品上传 / 镜像构建）。"
+spec:
+  workflowMetadata:
+    labels:
+      app.kubernetes.io/name: go-build
+      app.kubernetes.io/part-of: pipeline
+  serviceAccountName: argo
+  entrypoint: entrypoint
+  # 声明本模板依赖的卷。
+  # 说明：当父 Workflow 通过 templateRef 调用本模板时，Argo 不会自动带入这里的 volumes，
+  #       父 Workflow 需在自身的 spec.volumes 中声明同名卷（shared-data）。
+  #       这里保留声明是为了：1) 文档化依赖；2) 支持以 workflowTemplateRef 整体引用或独立测试。
+  volumes:
+    # 共享存储 PVC（基于 NFS，搭建见 docs/存储/基于NFS的PV-PVC共享存储搭建.md）
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: nfs-pvc
+  templates:
+    - name: entrypoint
+      activeDeadlineSeconds: 1800
+      nodeSelector:
+        kubernetes.io/os: linux
+      inputs:
+        parameters:
+          - name: pipeline-run-name
+            # default: "{{workflow.name}}"
+            default: "git-sync-qdpkt"
+            description: "本次运行名称，用作产物输出目录的隔离前缀（避免并发构建互相覆盖）"
+          - name: build-workspace-path
+            default: "/shared-data/workspace/git-sync-qdpkt/git"
+            description: "工作区根目录（上游 git-sync 同步源码的路径），脚本会 cd 进去执行构建"
+          - name: build-context-path
+            default: "."
+            description: "构建命令执行目录（go.mod 所在目录），相对工作区的路径，默认根目录。单模块项目填 . 即可；多模块 monorepo 填对应子模块目录（如 service-a）"
+          - name: build-module-path
+            default: "cmd/server"
+            description: "构建模块路径（main 函数所在目录），相对 build-context-path 的路径。如果 main 就在 go.mod 同级目录，填 . 即可"
+          - name: build-go-env
+            default: "CGO_ENABLED=0"
+            description: "构建时的环境变量前缀，默认禁用 CGO 做静态链接；可改成带 GOOS/GOARCH 等"
+          - name: build-artifact-name
+            default: "go-web-demo"
+            description: "产物二进制文件名（通常来自上游 git-sync 的同名出参，无扩展名）"
+          - name: build-go-image
+            default: "golang:1.26.4-alpine"
+            description: "构建容器镜像引用（自带 Go 工具链），如 golang:1.26.4-alpine"
+          - name: build-target-path
+            default: "/shared-data/target"
+            description: "pv 中保存制品的根目录（挂在共享 PVC 上，每次 run 在其下建子目录隔离）"
+      outputs:
+        parameters:
+          - name: build-artifact-path
+            valueFrom:
+              path: /tmp/build-artifact-path
+      script:
+        resources:
+          requests:
+            cpu: "0.5"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        volumeMounts:
+          # 共享存储：读上游 git-sync 的源码、写编译产物。
+          - mountPath: /shared-data/
+            name: shared-data
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+        # 构建镜像由入参 build-go-image 决定（自带 Go 工具链，而非固定镜像）。
+        # 国内拉取 Docker Hub 可能需要加速器，或在 worker 预加载后改 imagePullPolicy: Never。
+        image: "{{inputs.parameters.build-go-image}}"
+        imagePullPolicy: IfNotPresent
+        command: [ sh ]
+        source: |
+          set -eu
+
+          # ---------- 颜色（自包含，不依赖外部 configMap；Argo UI 会渲染 ANSI）----------
+          C_Y='\033[1;33m'; C_R='\033[1;31m'; C_OFF='\033[0m'
+          info()  { printf "${C_Y} [Info] %s${C_OFF}\n"  "$*"; }
+          error() { printf "${C_R} [Error] %s${C_OFF}\n" "$*"; }
+
+          # ---------- 错误码（集中定义，便于上游区分错误类型）----------
+          readonly EXIT_USER_ERROR=100       # 用户参数/配置错误（工作区/上下文目录不存在等）
+          readonly EXIT_BUILD_ERROR=110      # 编译失败（代码问题）
+          readonly EXIT_EXTERNAL_ERROR=170   # 外部依赖错误（依赖下载失败：GOPROXY/网络）
+
+          go version
+
+          # ---------- 1. 配置模块代理 GOPROXY ----------
+          # 暂不依赖私有 Artifactory，直接用公网代理 goproxy.cn，direct 兜底直连 VCS。
+          go env -w GOPROXY=https://goproxy.cn,direct
+
+          # ---------- 2. 进入工作区 ----------
+          if ! cd "{{inputs.parameters.build-workspace-path}}"; then
+            error "工作区目录不存在: {{inputs.parameters.build-workspace-path}}"
+            exit "$EXIT_USER_ERROR"
+          fi
+
+          # ---------- 3. 校验并进入构建命令执行目录（go.mod 所在目录）----------
+          ctx="{{inputs.parameters.build-context-path}}"
+          if [ ! -d "$ctx" ]; then
+            error "构建命令执行目录不存在: $ctx"
+            exit "$EXIT_USER_ERROR"
+          fi
+          cd "$ctx"
+          info "当前构建目录: $(pwd)"
+
+          # ---------- 4. 准备产物输出目录 ----------
+          # 产物路径用 pipeline-run-name 做前缀 → 并发隔离，多次 run 互不覆盖。
+          build_artifact_path="{{inputs.parameters.build-target-path}}/{{inputs.parameters.pipeline-run-name}}/{{inputs.parameters.build-artifact-name}}"
+          mkdir -p "$(dirname "$build_artifact_path")"
+
+          # ---------- 5. 下载依赖 ----------
+          # 在构建命令执行目录（go.mod 所在目录）执行 go mod download。
+          # 单独一步便于区分「依赖拉不下来」与「编译不过」。
+          info "下载 Go 模块依赖..."
+          if ! go mod download; then
+            error "依赖下载失败，请检查 GOPROXY 配置或网络"
+            exit "$EXIT_EXTERNAL_ERROR"
+          fi
+
+          # ---------- 6. 编译（核心）----------
+          # build-go-env 作为环境变量前缀展开（默认 CGO_ENABLED=0 静态编译）；
+          # -trimpath：裁剪源码绝对路径，利于可复现构建与安全；
+          # -v：打印被编译的包名，便于 CI 日志阅读。
+          #
+          # build-module-path 指定 main 函数所在目录（相对 build-context-path）。
+          # 规整路径：go build 把「不带 ./ ../ / 前缀」的参数当作 import path——
+          # 裸的 cmd/server 会去 GOROOT/src/cmd 找，报 "is not in std"，根本不查本模块。
+          # 故对裸相对路径补 ./ 强制按目录解析；入参已是目录形式（. ./xxx ../xxx /abs）
+          # 则保持原样，避免 ./.、././xxx 这类冗余拼接。
+          mod="{{inputs.parameters.build-module-path}}"
+          if [ ! -d "$mod" ]; then
+            error "构建模块路径不是一个目录: $mod"
+            exit "$EXIT_USER_ERROR"
+          fi
+          case "$mod" in
+            .*|/*) : ;;
+            *) mod="./$mod" ;;
+          esac
+          info "开始编译..."
+          if ! {{inputs.parameters.build-go-env}} go build -trimpath -v -o "$build_artifact_path" "$mod"; then
+            error "编译失败，请联系应用开发人员检查代码"
+            exit "$EXIT_BUILD_ERROR"
+          fi
+
+          # ---------- 7. 写出参 ----------
+          echo -n "$build_artifact_path" > /tmp/build-artifact-path
+          info "go-build 完成，产物: $build_artifact_path"

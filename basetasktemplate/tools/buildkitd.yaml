@@ -1,0 +1,147 @@
+# buildkitd 部署清单（学习环境精简版）
+#
+# 作用：在 argo 命名空间部署一个 buildkitd（镜像构建引擎），监听 tcp://buildkitd:1234，
+#       供 go-build-image 模板里的 buildctl 客户端 remote 连接。
+#
+# 核心配置点（buildkitd.toml）：把本地 nexus3 docker-hosted(8082) 声明为 HTTP 仓库，
+#       这样 Dockerfile 里 FROM 192.168.10.134:8082/... 的基础镜像走本地 nexus3 拉取，
+#       不再依赖外网 Docker Hub（见 docs/构建/镜像构建与推送设计.md「基础镜像走本地 nexus3」）。
+#
+# 取舍说明：本清单是「能跑、够用」的学习版——单副本、emptyDir 缓存、基本 GC、三探针。
+#       生产硬化（多副本、ephemeral-storage 硬上限、preStop 不杀在途构建、滚动零停机等）
+#       见 docs/构建/镜像构建与推送设计.md「后续演进」与 BuildKit 完整使用教程 §4.2.5。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: buildkitd
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/part-of: pipeline
+spec:
+  replicas: 1                      # 学习环境单副本即可；高频构建可调大（注意各副本本地缓存独立，勿共享同一路径）
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: buildkitd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: buildkitd
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      # 滚动升级/缩容时给在途构建一点排空时间（学习环境不必 1200s）。
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: buildkitd
+          # 与 go-build-image 里的 buildctl 客户端镜像版本保持一致（server/client 版本匹配）。
+          # 国内若拉取慢，可预推到 nexus3 后改为 192.168.10.134:8082/buildkit:v0.31.1
+          # （此时节点 containerd 需把 192.168.10.134:8082 配为 insecure registry）。
+          image: moby/buildkit:v0.31.1
+          imagePullPolicy: IfNotPresent
+          # 同时监听 unix socket（供容器内 buildctl 探针，默认地址）与 tcp（供 Argo Pod 远程连接）。
+          args:
+            - --addr
+            - unix:///run/buildkit/buildkitd.sock
+            - --addr
+            - tcp://0.0.0.0:1234
+          ports:
+            - name: grpc
+              containerPort: 1234
+              protocol: TCP
+          # buildkitd 用 overlayfs / runc / 命名空间等内核特性，需要特权。
+          # （若集群禁止 privileged，可改用 daemonless 模式或 rootless buildkitd。）
+          securityContext:
+            privileged: true
+          # buildkitd 启动偏慢，用 startupProbe 避免被 liveness 在启动期误杀。
+          startupProbe:
+            exec:
+              command: [buildctl, debug, workers]
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command: [buildctl, debug, workers]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: [buildctl, debug, workers]
+            periodSeconds: 30
+          volumeMounts:
+            # 挂载 buildkitd.toml（registry + GC 配置）
+            - name: buildkitd-config
+              mountPath: /etc/buildkit
+            # 构建缓存落在节点本地 emptyDir；Pod 重启即丢（学习环境可接受）。
+            # 若要跨重启保留缓存，可改用 PVC（注意：多副本勿共享同一缓存路径）。
+            - name: buildkit-cache
+              mountPath: /var/lib/buildkit
+      volumes:
+        - name: buildkitd-config
+          configMap:
+            name: buildkitd-config
+        - name: buildkit-cache
+          emptyDir:
+            sizeLimit: 15Gi       # kubelet 对 emptyDir 的硬上限，需大于 toml 里的 gckeepstorage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: buildkitd
+spec:
+  # 部署在 argo 命名空间，与 Workflow 同 ns，故 buildctl 用 tcp://buildkitd:1234 即可解析。
+  selector:
+    app.kubernetes.io/name: buildkitd
+  ports:
+    - name: grpc
+      port: 1234
+      targetPort: grpc
+      protocol: TCP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkitd-config
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: buildkitd-config
+    app.kubernetes.io/part-of: pipeline
+data:
+  buildkitd.toml: |
+    root = "/var/lib/buildkit"
+
+    # ── 本地 nexus3 作为基础镜像源（纯 HTTP 仓库）──────────────────────────
+    # 让 buildkitd 在 Dockerfile 里遇到 FROM 192.168.10.134:8082/... 时，用纯 HTTP 拉取。
+    # 关键正确性：nexus3 docker-hosted(8082) 是 HTTP，故用 http = true；
+    #   insecure = true 是给「HTTPS + 自签证书」用的，与 http 互斥（官方明确不可同时开）。
+    # 前提：① 相关基础镜像（如 alpine:3.22）已预推到 nexus3 docker-hosted；
+    #       ② nexus3 已开启匿名拉取（初始化向导 Enable anonymous access）。
+    [registry."192.168.10.134:8082"]
+      http = true
+
+    # 可选兜底：若个别镜像没预推到 nexus3、仍想走公网，可放开下面给 docker.io 配 mirror。
+    # 本环境目标是「完全不走外部源」，故默认注释。
+    # [registry."docker.io"]
+    #   mirrors = ["192.168.10.134:8082"]
+
+    # ── worker + GC（防止缓存无界增长）─────────────────────────────────
+    [worker.oci]
+      enabled = true
+      gc = true
+      snapshotter = "overlayfs"     # 若节点不支持 overlayfs，删掉此行让其回退 auto
+      gckeepstorage = 10000000000   # 软水位 10GB，超过即后台回收（须 < emptyDir sizeLimit 15Gi）
+
+    # 规则①：源码 / cache mount / git checkout 这类中间产物，保留 5GB 且 7 天内
+    [[worker.oci.gcpolicy]]
+      filters = ["type==source.local", "type==exec.cachemount", "type==source.git.checkout"]
+      keepBytes = 5000000000
+      keepDuration = 604800
+
+    # 规则②：兜底，全部记录保留 10GB
+    [[worker.oci.gcpolicy]]
+      all = true
+      keepBytes = 10000000000

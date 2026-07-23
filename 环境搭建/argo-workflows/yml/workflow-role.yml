@@ -1,0 +1,40 @@
+# 补齐官方 install.yaml 中被裁掉的「工作流 Pod」RBAC。
+#
+# 背景：argo3.4.8.yml 只给了 workflow-controller（argo SA）权限，
+# 而工作流步骤的 Pod 默认用命名空间的 default ServiceAccount 运行。
+# Argo executor（argoexec）在步骤结束时需要 patch 自身 Pod 来上报输出参数，
+# 若 default SA 无 RBAC，会报：
+#   pods "xxx" is forbidden: User "system:serviceaccount:argo:default" cannot patch resource "pods"
+# 导致步骤被标记为 Failed、输出参数无法传给下游。
+#
+# 应用：kubectl apply -f workflow-role.yml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: workflow-role
+  namespace: argo
+rules:
+  # executor 上报输出/状态需要 patch 自身 Pod
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "watch", "patch"]
+  # （可选）某些场景读取 Pod 日志
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workflow-default-binding
+  namespace: argo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: workflow-role
+subjects:
+  # 默认绑定给 default SA（模板未显式指定 serviceAccountName 时生效）
+  - kind: ServiceAccount
+    name: default
+    namespace: argo
